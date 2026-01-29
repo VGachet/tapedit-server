@@ -3,14 +3,14 @@ version: '3.8'
 services:
   export-server:
     build: .
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     environment:
       - NODE_ENV=production
       - PORT=3001
       - API_KEY=${API_KEY:-your-secret-api-key}
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-500}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://tapedit.studio,https://www.tapedit.studio}
     volumes:
       - ./temp:/app/temp
     restart: unless-stopped
@@ -20,3 +20,15 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    networks:
+      - traefik-public
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.tapedit-server.rule=Host(`api.tapedit.studio`)"
+      - "traefik.http.routers.tapedit-server.entrypoints=websecure"
+      - "traefik.http.routers.tapedit-server.tls.certresolver=letsencrypt"
+      - "traefik.http.services.tapedit-server.loadbalancer.server.port=3001"
+
+networks:
+  traefik-public:
+    external: true
