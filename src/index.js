@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const { spawn } = require('child_process');
 const path = require('path');
@@ -15,6 +16,30 @@ const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB) || 500) * 1024 * 1
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:3000')
   .split(',')
   .map(origin => origin.trim());
+
+// Trust proxy (needed for rate limiting behind Traefik)
+app.set('trust proxy', 1);
+
+// Rate limiting - 10 conversions per hour per IP
+const convertLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // 10 requests per hour
+  message: { error: 'Too many conversion requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip
+});
+
+// General rate limiting - 100 requests per 15 minutes
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  message: { error: 'Too many requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+app.use(generalLimiter);
 
 // CORS configuration
 app.use(cors({
@@ -74,7 +99,7 @@ app.get('/health', (req, res) => {
 });
 
 // Convert endpoint
-app.post('/convert', requireApiKey, upload.fields([
+app.post('/convert', convertLimiter, requireApiKey, upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'audio', maxCount: 1 }
 ]), async (req, res) => {
