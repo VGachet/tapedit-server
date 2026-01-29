@@ -1,7 +1,7 @@
 FROM node:20-alpine
 
-# Install FFmpeg
-RUN apk add --no-cache ffmpeg
+# Install FFmpeg and wget for healthcheck
+RUN apk add --no-cache ffmpeg wget
 
 # Create app directory
 WORKDIR /app

@@ -24,9 +24,16 @@ services:
       - traefik-public
     labels:
       - "traefik.enable=true"
+      # HTTP -> HTTPS redirect
+      - "traefik.http.routers.tapedit-server.entrypoints=http"
       - "traefik.http.routers.tapedit-server.rule=Host(`api.tapedit.studio`)"
-      - "traefik.http.routers.tapedit-server.entrypoints=websecure"
-      - "traefik.http.routers.tapedit-server.tls.certresolver=letsencrypt"
+      - "traefik.http.middlewares.tapedit-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.tapedit-server.middlewares=tapedit-https-redirect"
+      # HTTPS
+      - "traefik.http.routers.tapedit-server-secure.entrypoints=https"
+      - "traefik.http.routers.tapedit-server-secure.rule=Host(`api.tapedit.studio`)"
+      - "traefik.http.routers.tapedit-server-secure.tls=true"
+      - "traefik.http.routers.tapedit-server-secure.tls.certresolver=letsencrypt"
       - "traefik.http.services.tapedit-server.loadbalancer.server.port=3001"
 
 networks:
