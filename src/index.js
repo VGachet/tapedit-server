@@ -98,163 +98,143 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Convert endpoint
+// Convert endpoint — returns job ID immediately, processes FFmpeg in background
+// to avoid proxy/gateway timeouts during long conversions
 app.post('/convert', convertLimiter, requireApiKey, upload.fields([
   { name: 'video', maxCount: 1 },
   { name: 'audio', maxCount: 1 }
-]), async (req, res) => {
+]), (req, res) => {
   const conversionId = uuidv4();
-  let videoPath = null;
-  let audioPath = null;
-  let outputPath = null;
 
-  try {
-    if (!req.files || !req.files.video) {
-      return res.status(400).json({ error: 'No video file provided' });
-    }
-
-    videoPath = req.files.video[0].path;
-    audioPath = req.files.audio ? req.files.audio[0].path : null;
-    outputPath = path.join(tempDir, `${conversionId}.mp4`);
-
-    const options = {
-      quality: req.body.quality || 'high',
-      fps: parseInt(req.body.fps) || 30,
-      filename: req.body.filename || 'export.mp4'
-    };
-
-    // Quality presets
-    const qualityPresets = {
-      low: { videoBitrate: '2000k', audioBitrate: '128k', preset: 'veryfast' },
-      medium: { videoBitrate: '5000k', audioBitrate: '192k', preset: 'medium' },
-      high: { videoBitrate: '10000k', audioBitrate: '256k', preset: 'slow' }
-    };
-
-    const preset = qualityPresets[options.quality] || qualityPresets.high;
-
-    console.log(`[${conversionId}] Starting conversion...`);
-    console.log(`  Video: ${videoPath}`);
-    console.log(`  Audio: ${audioPath || 'none'}`);
-    console.log(`  Quality: ${options.quality}`);
-    console.log(`  FPS: ${options.fps}`);
-
-    // Initialize progress tracking
-    activeConversions.set(conversionId, { progress: 0, status: 'processing' });
-
-    await new Promise((resolve, reject) => {
-      // Build FFmpeg arguments
-      const args = ['-y', '-i', videoPath];
-      
-      if (audioPath) {
-        args.push('-i', audioPath);
-      }
-
-      // Video encoding
-      args.push(
-        '-c:v', 'libx264',
-        '-b:v', preset.videoBitrate,
-        '-preset', preset.preset,
-        '-profile:v', 'high',
-        '-level', '4.1',
-        '-pix_fmt', 'yuv420p',
-        '-movflags', '+faststart',
-        '-r', String(options.fps)
-      );
-
-      // Audio options
-      if (audioPath) {
-        args.push(
-          '-c:a', 'aac',
-          '-b:a', preset.audioBitrate,
-          '-ar', '44100',
-          '-map', '0:v:0',
-          '-map', '1:a:0',
-          '-shortest'
-        );
-      } else {
-        args.push('-an');
-      }
-
-      // Progress output
-      args.push('-progress', 'pipe:1');
-      args.push(outputPath);
-
-      console.log(`[${conversionId}] FFmpeg command: ffmpeg ${args.join(' ')}`);
-
-      const ffmpegProcess = spawn('ffmpeg', args);
-      let duration = null;
-
-      ffmpegProcess.stderr.on('data', (data) => {
-        const output = data.toString();
-        // Extract duration from input
-        const durationMatch = output.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
-        if (durationMatch) {
-          const hours = parseInt(durationMatch[1]);
-          const minutes = parseInt(durationMatch[2]);
-          const seconds = parseFloat(durationMatch[3]);
-          duration = hours * 3600 + minutes * 60 + seconds;
-        }
-      });
-
-      ffmpegProcess.stdout.on('data', (data) => {
-        const output = data.toString();
-        // Parse progress from ffmpeg output
-        const timeMatch = output.match(/out_time_ms=(\d+)/);
-        if (timeMatch && duration) {
-          const currentTime = parseInt(timeMatch[1]) / 1000000;
-          const percent = Math.min((currentTime / duration) * 100, 99);
-          activeConversions.set(conversionId, { progress: percent, status: 'processing' });
-          console.log(`[${conversionId}] Progress: ${percent.toFixed(1)}%`);
-        }
-      });
-
-      ffmpegProcess.on('close', (code) => {
-        if (code === 0) {
-          console.log(`[${conversionId}] Conversion complete`);
-          activeConversions.set(conversionId, { progress: 100, status: 'complete' });
-          resolve();
-        } else {
-          reject(new Error(`FFmpeg exited with code ${code}`));
-        }
-      });
-
-      ffmpegProcess.on('error', (err) => {
-        console.error(`[${conversionId}] Error: ${err.message}`);
-        activeConversions.delete(conversionId);
-        reject(err);
-      });
-    });
-
-    // Send the converted file
-    const stat = fs.statSync(outputPath);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Length', stat.size);
-    res.setHeader('Content-Disposition', `attachment; filename="${options.filename}"`);
-
-    const readStream = fs.createReadStream(outputPath);
-    readStream.pipe(res);
-
-    readStream.on('end', () => {
-      // Cleanup files after sending
-      cleanup(videoPath, audioPath, outputPath);
-      activeConversions.delete(conversionId);
-    });
-
-    readStream.on('error', (err) => {
-      console.error(`[${conversionId}] Stream error: ${err.message}`);
-      cleanup(videoPath, audioPath, outputPath);
-      activeConversions.delete(conversionId);
-    });
-
-  } catch (error) {
-    console.error(`Conversion error: ${error.message}`);
-    cleanup(videoPath, audioPath, outputPath);
-    activeConversions.delete(conversionId);
-    
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Conversion failed', details: error.message });
-    }
+  if (!req.files || !req.files.video) {
+    return res.status(400).json({ error: 'No video file provided' });
   }
+
+  const videoPath = req.files.video[0].path;
+  const audioPath = req.files.audio ? req.files.audio[0].path : null;
+  const outputPath = path.join(tempDir, `${conversionId}.mp4`);
+
+  const options = {
+    quality: req.body.quality || 'high',
+    fps: parseInt(req.body.fps) || 30,
+    filename: req.body.filename || 'export.mp4'
+  };
+
+  // Quality presets
+  const qualityPresets = {
+    low: { videoBitrate: '2000k', audioBitrate: '128k', preset: 'veryfast' },
+    medium: { videoBitrate: '5000k', audioBitrate: '192k', preset: 'medium' },
+    high: { videoBitrate: '10000k', audioBitrate: '256k', preset: 'slow' }
+  };
+
+  const preset = qualityPresets[options.quality] || qualityPresets.high;
+
+  console.log(`[${conversionId}] Starting async conversion...`);
+  console.log(`  Video: ${videoPath}`);
+  console.log(`  Audio: ${audioPath || 'none'}`);
+  console.log(`  Quality: ${options.quality}`);
+  console.log(`  FPS: ${options.fps}`);
+
+  // Initialize progress tracking before responding
+  activeConversions.set(conversionId, {
+    progress: 0,
+    status: 'processing',
+    filename: options.filename,
+    outputPath,
+    videoPath,
+    audioPath,
+  });
+
+  // Respond immediately with the job ID — prevents proxy timeouts
+  res.json({ id: conversionId });
+
+  // Run FFmpeg in background (fire and forget — progress tracked in activeConversions)
+  const args = ['-y', '-i', videoPath];
+
+  if (audioPath) {
+    args.push('-i', audioPath);
+  }
+
+  args.push(
+    '-c:v', 'libx264',
+    '-b:v', preset.videoBitrate,
+    '-preset', preset.preset,
+    '-profile:v', 'high',
+    '-level', '4.1',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    '-r', String(options.fps)
+  );
+
+  if (audioPath) {
+    args.push(
+      '-c:a', 'aac',
+      '-b:a', preset.audioBitrate,
+      '-ar', '44100',
+      '-map', '0:v:0',
+      '-map', '1:a:0',
+      '-shortest'
+    );
+  } else {
+    args.push('-an');
+  }
+
+  args.push('-progress', 'pipe:1');
+  args.push(outputPath);
+
+  console.log(`[${conversionId}] FFmpeg command: ffmpeg ${args.join(' ')}`);
+
+  const ffmpegProcess = spawn('ffmpeg', args);
+  let duration = null;
+
+  ffmpegProcess.stderr.on('data', (data) => {
+    const output = data.toString();
+    const durationMatch = output.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+    if (durationMatch) {
+      const hours = parseInt(durationMatch[1]);
+      const minutes = parseInt(durationMatch[2]);
+      const seconds = parseFloat(durationMatch[3]);
+      duration = hours * 3600 + minutes * 60 + seconds;
+    }
+  });
+
+  ffmpegProcess.stdout.on('data', (data) => {
+    const output = data.toString();
+    const timeMatch = output.match(/out_time_ms=(\d+)/);
+    if (timeMatch && duration) {
+      const currentTime = parseInt(timeMatch[1]) / 1000000;
+      const percent = Math.min((currentTime / duration) * 100, 99);
+      const current = activeConversions.get(conversionId);
+      if (current) {
+        activeConversions.set(conversionId, { ...current, progress: percent });
+      }
+      console.log(`[${conversionId}] Progress: ${percent.toFixed(1)}%`);
+    }
+  });
+
+  ffmpegProcess.on('close', (code) => {
+    const current = activeConversions.get(conversionId);
+    if (!current) return;
+    if (code === 0) {
+      console.log(`[${conversionId}] Conversion complete`);
+      activeConversions.set(conversionId, { ...current, progress: 100, status: 'complete' });
+      // Clean up input files now that output is ready
+      cleanup(videoPath, audioPath);
+    } else {
+      console.error(`[${conversionId}] FFmpeg exited with code ${code}`);
+      activeConversions.set(conversionId, { ...current, status: 'error', error: `FFmpeg exited with code ${code}` });
+      cleanup(videoPath, audioPath, outputPath);
+    }
+  });
+
+  ffmpegProcess.on('error', (err) => {
+    console.error(`[${conversionId}] Spawn error: ${err.message}`);
+    const current = activeConversions.get(conversionId);
+    if (current) {
+      activeConversions.set(conversionId, { ...current, status: 'error', error: err.message });
+    }
+    cleanup(videoPath, audioPath, outputPath);
+  });
 });
 
 // Progress endpoint
@@ -263,7 +243,45 @@ app.get('/progress/:id', requireApiKey, (req, res) => {
   if (!conversion) {
     return res.status(404).json({ error: 'Conversion not found' });
   }
-  res.json(conversion);
+  const { outputPath, videoPath, audioPath, filename, ...safeFields } = conversion;
+  res.json(safeFields);
+});
+
+// Download endpoint — streams the completed MP4 then cleans up
+app.get('/download/:id', requireApiKey, (req, res) => {
+  const conversion = activeConversions.get(req.params.id);
+  if (!conversion) {
+    return res.status(404).json({ error: 'Conversion not found' });
+  }
+  if (conversion.status !== 'complete') {
+    return res.status(409).json({ error: 'Conversion not ready', status: conversion.status });
+  }
+
+  const { outputPath, filename } = conversion;
+
+  if (!fs.existsSync(outputPath)) {
+    activeConversions.delete(req.params.id);
+    return res.status(410).json({ error: 'Output file no longer available' });
+  }
+
+  const stat = fs.statSync(outputPath);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+  const readStream = fs.createReadStream(outputPath);
+  readStream.pipe(res);
+
+  readStream.on('end', () => {
+    cleanup(outputPath);
+    activeConversions.delete(req.params.id);
+  });
+
+  readStream.on('error', (err) => {
+    console.error(`[${req.params.id}] Stream error: ${err.message}`);
+    cleanup(outputPath);
+    activeConversions.delete(req.params.id);
+  });
 });
 
 // Cleanup helper
