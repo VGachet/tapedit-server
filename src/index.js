@@ -10,7 +10,8 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const API_KEY = process.env.API_KEY || 'your-secret-api-key';
-const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB) || 500) * 1024 * 1024;
+const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_SIZE_MB) || 200) * 1024 * 1024;
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_JOBS) || 1;
 
 // Parse allowed origins
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:3000')
@@ -88,6 +89,29 @@ const requireApiKey = (req, res, next) => {
 // Track active conversions for progress
 const activeConversions = new Map();
 
+// Simple FIFO queue: limits concurrent FFmpeg processes to cap CPU/RAM usage
+const jobQueue = [];
+let runningJobs = 0;
+
+function enqueueJob(start) {
+  jobQueue.push(start);
+  drainQueue();
+}
+
+function drainQueue() {
+  while (runningJobs < MAX_CONCURRENT && jobQueue.length > 0) {
+    const start = jobQueue.shift();
+    runningJobs++;
+    let released = false;
+    start(() => {
+      if (released) return;
+      released = true;
+      runningJobs--;
+      drainQueue();
+    });
+  }
+}
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
@@ -123,8 +147,8 @@ app.post('/convert', convertLimiter, requireApiKey, upload.fields([
   // Quality presets
   const qualityPresets = {
     low: { videoBitrate: '2000k', audioBitrate: '128k', preset: 'veryfast' },
-    medium: { videoBitrate: '5000k', audioBitrate: '192k', preset: 'medium' },
-    high: { videoBitrate: '10000k', audioBitrate: '256k', preset: 'slow' }
+    medium: { videoBitrate: '5000k', audioBitrate: '192k', preset: 'veryfast' },
+    high: { videoBitrate: '10000k', audioBitrate: '256k', preset: 'fast' }
   };
 
   const preset = qualityPresets[options.quality] || qualityPresets.high;
@@ -148,6 +172,9 @@ app.post('/convert', convertLimiter, requireApiKey, upload.fields([
   // Respond immediately with the job ID — prevents proxy timeouts
   res.json({ id: conversionId });
 
+  // Video already H.264 MP4 (muxed client-side): just copy the video stream, no re-encode
+  const videoIsMp4 = path.extname(videoPath).toLowerCase() === '.mp4';
+
   // Run FFmpeg in background (fire and forget — progress tracked in activeConversions)
   const args = ['-y', '-i', videoPath];
 
@@ -155,16 +182,20 @@ app.post('/convert', convertLimiter, requireApiKey, upload.fields([
     args.push('-i', audioPath);
   }
 
-  args.push(
-    '-c:v', 'libx264',
-    '-b:v', preset.videoBitrate,
-    '-preset', preset.preset,
-    '-profile:v', 'high',
-    '-level', '4.1',
-    '-pix_fmt', 'yuv420p',
-    '-movflags', '+faststart',
-    '-r', String(options.fps)
-  );
+  if (videoIsMp4) {
+    args.push('-c:v', 'copy', '-movflags', '+faststart');
+  } else {
+    args.push(
+      '-c:v', 'libx264',
+      '-b:v', preset.videoBitrate,
+      '-preset', preset.preset,
+      '-profile:v', 'high',
+      '-level', '4.1',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-r', String(options.fps)
+    );
+  }
 
   if (audioPath) {
     args.push(
@@ -184,56 +215,60 @@ app.post('/convert', convertLimiter, requireApiKey, upload.fields([
 
   console.log(`[${conversionId}] FFmpeg command: ffmpeg ${args.join(' ')}`);
 
-  const ffmpegProcess = spawn('ffmpeg', args);
-  let duration = null;
+  enqueueJob((release) => {
+    const ffmpegProcess = spawn('ffmpeg', args);
+    let duration = null;
 
-  ffmpegProcess.stderr.on('data', (data) => {
-    const output = data.toString();
-    const durationMatch = output.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
-    if (durationMatch) {
-      const hours = parseInt(durationMatch[1]);
-      const minutes = parseInt(durationMatch[2]);
-      const seconds = parseFloat(durationMatch[3]);
-      duration = hours * 3600 + minutes * 60 + seconds;
-    }
-  });
+    ffmpegProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      const durationMatch = output.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+      if (durationMatch) {
+        const hours = parseInt(durationMatch[1]);
+        const minutes = parseInt(durationMatch[2]);
+        const seconds = parseFloat(durationMatch[3]);
+        duration = hours * 3600 + minutes * 60 + seconds;
+      }
+    });
 
-  ffmpegProcess.stdout.on('data', (data) => {
-    const output = data.toString();
-    const timeMatch = output.match(/out_time_ms=(\d+)/);
-    if (timeMatch && duration) {
-      const currentTime = parseInt(timeMatch[1]) / 1000000;
-      const percent = Math.min((currentTime / duration) * 100, 99);
+    ffmpegProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      const timeMatch = output.match(/out_time_ms=(\d+)/);
+      if (timeMatch && duration) {
+        const currentTime = parseInt(timeMatch[1]) / 1000000;
+        const percent = Math.min((currentTime / duration) * 100, 99);
+        const current = activeConversions.get(conversionId);
+        if (current) {
+          activeConversions.set(conversionId, { ...current, progress: percent });
+        }
+        console.log(`[${conversionId}] Progress: ${percent.toFixed(1)}%`);
+      }
+    });
+
+    ffmpegProcess.on('close', (code) => {
+      release();
+      const current = activeConversions.get(conversionId);
+      if (!current) return;
+      if (code === 0) {
+        console.log(`[${conversionId}] Conversion complete`);
+        activeConversions.set(conversionId, { ...current, progress: 100, status: 'complete' });
+        // Clean up input files now that output is ready
+        cleanup(videoPath, audioPath);
+      } else {
+        console.error(`[${conversionId}] FFmpeg exited with code ${code}`);
+        activeConversions.set(conversionId, { ...current, status: 'error', error: `FFmpeg exited with code ${code}` });
+        cleanup(videoPath, audioPath, outputPath);
+      }
+    });
+
+    ffmpegProcess.on('error', (err) => {
+      release();
+      console.error(`[${conversionId}] Spawn error: ${err.message}`);
       const current = activeConversions.get(conversionId);
       if (current) {
-        activeConversions.set(conversionId, { ...current, progress: percent });
+        activeConversions.set(conversionId, { ...current, status: 'error', error: err.message });
       }
-      console.log(`[${conversionId}] Progress: ${percent.toFixed(1)}%`);
-    }
-  });
-
-  ffmpegProcess.on('close', (code) => {
-    const current = activeConversions.get(conversionId);
-    if (!current) return;
-    if (code === 0) {
-      console.log(`[${conversionId}] Conversion complete`);
-      activeConversions.set(conversionId, { ...current, progress: 100, status: 'complete' });
-      // Clean up input files now that output is ready
-      cleanup(videoPath, audioPath);
-    } else {
-      console.error(`[${conversionId}] FFmpeg exited with code ${code}`);
-      activeConversions.set(conversionId, { ...current, status: 'error', error: `FFmpeg exited with code ${code}` });
       cleanup(videoPath, audioPath, outputPath);
-    }
-  });
-
-  ffmpegProcess.on('error', (err) => {
-    console.error(`[${conversionId}] Spawn error: ${err.message}`);
-    const current = activeConversions.get(conversionId);
-    if (current) {
-      activeConversions.set(conversionId, { ...current, status: 'error', error: err.message });
-    }
-    cleanup(videoPath, audioPath, outputPath);
+    });
   });
 });
 
